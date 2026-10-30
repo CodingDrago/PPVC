@@ -1,16 +1,49 @@
-# ⚡ Analog Circuit Fixer
+# ⚡ Circuit Assistant (Analog Circuit Fixer)
 
-**Analog Circuit Fixer** is an autonomous analog circuit debugging and optimization web application built in Python using Streamlit, ngspice, Plotly, and SciPy.
+**Circuit Assistant** is an instrument-grade, autonomous analog circuit design, physical SPICE simulation, and component repair application. Built for electronics engineers and students, it features a **"Lab Bench at Night"** dark instrument aesthetic, CRT oscilloscope visualizations, live blueprint schematics, and an autonomous optimization pipeline.
 
-The user selects a broken analog circuit netlist and a performance specification. The application simulates the circuit in **ngspice**, diagnoses failure root causes using an **LLM** (or cached expert demo rules), runs a **numerical optimizer** with SPICE in the loop, snaps components to **commercial E-series values** (E24 resistors, E12 capacitors), and re-simulates to confirm compliance.
+The user describes a circuit requirement in plain English (or clicks an example prompt). The application translates the requirement into circuit specifications, executes high-fidelity **ngspice** simulations, diagnoses failure modes with **Google Gemini** (or offline engineering heuristics), executes a **numerical optimizer** with SPICE in the loop, and snaps components to standard **commercial E-series values** (E24 resistors, E12 capacitors).
 
-> **Key Rule:** The LLM never claims success. Only the simulation result decides pass/fail.
+> **Key Rule:** The AI never claims success on its own. Only physical SPICE simulation results decide pass or fail.
 
 ---
 
-## 🛠️ Supported Circuits & Templates
+## 🎨 Interface & Design Language: "Lab Bench at Night"
+
+The user interface feels like a high-end oscilloscope and benchtop instrument rather than a generic dashboard:
+* **Hardware Color Palette:** Deep CRT background (`#070A0D`), dark instrument panels (`#0E1419`), panel borders (`#1B2A33`), PCB copper traces (`#C8742B`), phosphor green readouts (`#39FF88`), scope amber (`#FFB000`), signal cyan (`#35D0FF`), and fail red (`#FF4D5E`).
+* **Instrument Typography:** Google Fonts `@import` featuring **Space Grotesk** (headings and chassis labels), **JetBrains Mono** (labels, netlists, and code), and **Share Tech Mono** (high-visibility digital readouts).
+* **Subtle PCB Background:** Inline SVG data-URI with thin 45°/90° copper traces and circular via pads at low opacity with a graticule grid.
+* **Front Panel Sidebar:** Styled like an instrument rack faceplate with a custom vector logo (sine wave through resistor zigzag), status LEDs, and a **Verified Mode** solver switch.
+* **Status Lamps & 7-Segment Displays:** Large verified verdict banners, 7-segment readouts with deltas, and silkscreen chassis labels (`CH1`, `DUT`, `BODE`).
+
+---
+
+## 🔬 Signature Instrument Components
+
+1. **Oscilloscope Bode View (Hero Component):**
+   * HTML5 Canvas CRT with a 10×8 graticule, minor tick marks, rounded bezel, scanline overlay, and phosphor glow.
+   * Sweeps in the broken response in amber/red over 1.2s, followed by the phosphor green fixed curve.
+   * Features a vertical dashed `TARGET fc` cursor, horizontal `-3 dB` reference line, and interactive mouse-hover crosshair HUD.
+2. **Live Blueprint Schematic:**
+   * Inline SVG schematic (op-amp, resistors, capacitors, ground symbols, and terminals).
+   * Displays live component values. When repaired, changed parts flash amber and morph to their commercial values.
+   * A glowing cyan electron particle continuously loops along the signal path.
+3. **PCB Pipeline Strip:**
+   * 4-station PCB trace route: `SIMULATE` ➔ `DIAGNOSE (AI)` ➔ `OPTIMIZE` ➔ `VERIFY`.
+   * Displays traveling copper pulses, active state LEDs (amber when active, phosphor green when done), and real-time captioning.
+4. **Signal Cleanup View (Time-Domain Scopes):**
+   * Three stacked mini CRT scopes: **What goes in** (grey), **Before fix** (amber/red), and **After fix** (phosphor green).
+   * Demonstrates how the repaired circuit removes noise and distortion in real time.
+5. **Firmware Boot Sequence:**
+   * Terminal typeout on empty state (<2s) testing ngspice, optimizer, and AI engine status with an idling phosphor sine wave.
+
+---
+
+## 🛠️ Supported Circuit Templates
 
 ### 1. Sallen-Key 2nd-Order Low-Pass Filter (Unity Gain)
+* **What it does:** Passes desirable low frequencies freely while cutting off unwanted high-frequency noise and hiss.
 * **Target Specifications:**
   * Cutoff frequency $f_c = 1.0\text{ kHz}$ ($\pm 5\%$, $950\text{ to }1050\text{ Hz}$)
   * Passband Peaking $\le 0.5\text{ dB}$ (Butterworth response, $Q \approx 0.707$)
@@ -20,6 +53,7 @@ The user selects a broken analog circuit netlist and a performance specification
   * Causes $f_c \approx 1.42\text{ kHz}$ and severe $\approx 4.45\text{ dB}$ resonant peaking ($Q \approx 1.58$).
 
 ### 2. Non-Inverting Amplifier
+* **What it does:** Cleanly amplifies a weak input voltage to a stronger output voltage without inverting polarity.
 * **Target Specifications:**
   * Linear Gain $= 10.0$ ($\pm 2\%$, $9.8\text{ to }10.2\times$, $20\text{ dB}$)
   * $-3\text{ dB}$ Bandwidth $\ge 50\text{ kHz}$
@@ -31,7 +65,25 @@ The user selects a broken analog circuit netlist and a performance specification
 Uses a realistic single-pole macro model (`OPAMP_1POLE`) with:
 * DC Gain $A_0 = 10^5$ ($100\text{ dB}$)
 * Gain-Bandwidth Product $\text{GBW} = 1.0\text{ MHz}$ (dominant pole at $f_p = 10\text{ Hz}$)
-* Avoids ideal op-amps so real-world gain-bandwidth limitations are captured.
+
+---
+
+## 🤖 Google Gemini AI & Offline Demo Mode
+
+The application uses Google Gemini via the official `google-genai` SDK:
+* Automatically loads configuration from `.env` via `python-dotenv`.
+* Structured JSON mode (`response_mime_type="application/json"`) for circuit design and diagnosis.
+* Strict 8-second timeout enforcement.
+* **Offline Demo Mode:** If `GEMINI_API_KEY` is absent, `DEMO=1` is set, or a network timeout/error occurs, the app silently and instantly falls back to rule-based engineering heuristics.
+* The sidebar displays a status indicator: `AI: Gemini online` or `AI: offline demo mode`.
+
+### Configuration (`.env`)
+Create a `.env` file in the root directory (see `.env.example`):
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.5-flash
+DEMO=0
+```
 
 ---
 
@@ -39,22 +91,15 @@ Uses a realistic single-pole macro model (`OPAMP_1POLE`) with:
 
 ### 1. Prerequisites
 * Python 3.10+
-* `ngspice` installed and available in PATH (or `C:\Spice64\bin\ngspice_con.exe` / `C:\Spice64\bin\ngspice.exe` on Windows).
+* `ngspice` installed and available in PATH (or `C:\Spice64\bin\ngspice_con.exe` on Windows).
 
-#### Installing ngspice:
-* **Windows:**
-  * Download portable zip from [ngspice sourceforge](https://sourceforge.net/projects/ngspice/files/ng-spice-rework/) and extract `Spice64` to `C:\` or your user folder (`C:\Users\<username>\Spice64\bin`).
-  * Or install via Chocolatey: `choco install ngspice -y`
-* **Ubuntu/Debian:** `sudo apt-get install ngspice`
-* **macOS:** `brew install ngspice`
-
-### 2. Install Python Dependencies
+### 2. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Run the Headless Test
-Verifies end-to-end operation with the Sallen-Key broken preset in headless mode:
+### 3. Run Headless Verification Test
+Verifies end-to-end SPICE simulation, Nelder-Mead optimization, and E-series snapping:
 ```bash
 python test_headless.py
 ```
@@ -67,40 +112,18 @@ Open your browser at `http://localhost:8501`.
 
 ---
 
-## 🤖 LLM & Demo Mode Configuration
-
-The application includes a **Cached Demo Mode** that runs deterministically with zero external API dependencies:
-* Set `DEMO=1` in your environment or leave the API Key field blank in the sidebar to run in Demo Mode.
-* To use a live LLM:
-  ```bash
-  export LLM_API_KEY="your-api-key"
-  # Optional: custom provider or model
-  export LLM_BASE_URL="https://api.openai.com/v1"
-  export LLM_MODEL="gpt-4o-mini"
-  ```
-  Or input your API key directly in the Streamlit sidebar.
-
----
-
 ## 📂 Project Architecture
 
 ```
 PPVC/
-├── app.py             # Streamlit UI (wide layout, Plotly Bode plot, netlist diff, BOM)
-├── spice.py           # Circuit templates, SPICE netlist generation, ngspice execution, E-series snapping
-├── agent.py           # Unified LLM provider, SciPy Nelder-Mead optimizer, agent loop
-├── test_headless.py   # Headless automated test for Sallen-Key broken preset
-├── requirements.txt   # Python package dependencies
-└── README.md          # Documentation and run steps
+├── app.py             # Main Streamlit app (Instrument shell, chat front door, metric displays)
+├── theme.py           # "Lab Bench at Night" CSS variables, PCB background, tactile styles
+├── components.py      # Custom CRT oscilloscope, live schematic SVG, pipeline strip, boot console
+├── spice.py           # Netlist generators, ngspice simulation runner, measurement & E-series logic
+├── agent.py           # Google Gemini provider, SciPy Nelder-Mead optimizer, autonomous agent loop
+├── test_headless.py   # Headless automated regression test
+├── requirements.txt   # Package dependencies
+├── .env.example       # Example environment variables
+├── .gitignore         # Git ignore rules (.env, __pycache__)
+└── README.md          # Project documentation
 ```
-
----
-
-## 🔬 How the Agent Loop Works
-
-1. **Simulation:** Runs batch `ngspice -b` with `.control` block AC sweep ($10\text{ Hz}$ to $1\text{ MHz}$, 200 pts/dec) and parses output using `numpy`.
-2. **Measurement & Verification:** Calculates DC gain, $-3\text{ dB}$ cutoff/bandwidth, and peaking. Evaluates against tolerances.
-3. **LLM Diagnosis:** If failing, prompts the LLM to output pure JSON containing failure diagnosis, components to tune, search bounds, and rationale.
-4. **Numerical Optimization:** Runs `scipy.optimize.minimize` (Nelder-Mead) over $\log_{10}$ of component values with SPICE simulation in the loop.
-5. **Commercial Snapping:** Snaps resistors to the **E24 series** ($\pm 5\%$) and capacitors to the **E12 series** ($\pm 10\%$), performing fine neighbor checks if necessary.
-6. **Pass/Fail Decision:** Re-simulates the final circuit and compares against specifications. Stops on PASS or maximum 4 iterations.

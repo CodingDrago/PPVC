@@ -210,8 +210,9 @@ CIRCUITS = {
 }
 
 
-def generate_netlist(circuit_id: str, components: dict, out_file: str = "ac_out.txt") -> str:
+def generate_netlist(circuit_id: str, components: dict = None, out_file: str = "ac_out.txt") -> str:
     """Generate SPICE netlist text from component dictionary."""
+    components = components or {}
     out_spice_path = out_file.replace("\\", "/")
 
     if circuit_id == "sallen_key":
@@ -333,8 +334,17 @@ def simulate_circuit(circuit_id: str, components: dict, timeout: float = 3.0):
                 pass
 
 
-def measure_circuit(freqs: np.ndarray, gain_db: np.ndarray, circuit_type: str) -> dict:
+def measure_circuit(freqs: np.ndarray, gain_db: np.ndarray, circuit_type: str = "") -> dict:
     """Calculate key analog metrics from frequency and gain_db arrays."""
+    if freqs is None or gain_db is None or len(gain_db) == 0:
+        return {
+            "dc_gain_db": 0.0,
+            "linear_gain": 1.0,
+            "peaking_db": 0.0,
+            "fc_3db_hz": 0.0,
+            "bandwidth_hz": 0.0
+        }
+
     dc_gain_db = float(gain_db[0])
     linear_gain = float(10.0 ** (dc_gain_db / 20.0))
     peaking_db = max(0.0, float(np.max(gain_db) - dc_gain_db))
@@ -364,11 +374,12 @@ def measure_circuit(freqs: np.ndarray, gain_db: np.ndarray, circuit_type: str) -
     }
 
 
-def evaluate_spec(circuit_id: str, measurements: dict, specs: dict = None) -> tuple[bool, list]:
+def evaluate_spec(circuit_id: str, measurements: dict = None, specs: dict = None) -> tuple[bool, list]:
     """
     Compare measurements against specs.
     Returns (all_passed: bool, metrics_table: list[dict]).
     """
+    measurements = measurements or {}
     if specs is None:
         specs = CIRCUITS[circuit_id]["default_specs"]
 
@@ -462,3 +473,96 @@ def evaluate_spec(circuit_id: str, measurements: dict, specs: dict = None) -> tu
         })
 
     return all_passed, metrics
+
+
+def simulate_transient(circuit_id: str, components: dict, specs: dict = None, timeout: float = 5.0):
+    """
+    Simulate circuit transient response in batch mode with ngspice.
+    For low-pass filters: uses a behavioral source summing a wanted tone (0.2*fc) and noise tone (5*fc).
+    For amplifiers: uses a small sinusoidal source (10 mV peak at 1 kHz).
+    Returns (time_arr, v_in, v_out).
+    """
+    if specs is None:
+        specs = CIRCUITS[circuit_id]["default_specs"]
+
+    ngspice_bin = find_ngspice()
+
+    if circuit_id == "sallen_key":
+        fc = specs.get("fc_target", 1000.0)
+        f_wanted = 0.2 * fc
+        f_noise = 5.0 * fc
+        t_stop = 2.5 / f_wanted
+        t_step = 1.0 / (50.0 * f_noise)
+        r1_s = format_spice_val(components.get("R1", 7.5e3))
+        r2_s = format_spice_val(components.get("R2", 7.5e3))
+        c1_s = format_spice_val(components.get("C1", 68e-9))
+        c2_s = format_spice_val(components.get("C2", 6.8e-9))
+        source_line = f"B1 in 0 V=sin(2*3.1415926535*{f_wanted}*time) + 0.5*sin(2*3.1415926535*{f_noise}*time)"
+        circuit_lines = f"""R1 in n1 {r1_s}
+R2 n1 n_plus {r2_s}
+C1 n1 out {c1_s}
+C2 n_plus 0 {c2_s}
+XOP n_plus out out 0 OPAMP_1POLE
+"""
+    elif circuit_id == "non_inverting_amp":
+        f_wanted = 1000.0
+        t_stop = 3.0 / f_wanted
+        t_step = 1.0 / (200.0 * f_wanted)
+        rf_s = format_spice_val(components.get("Rf", 100e3))
+        rg_s = format_spice_val(components.get("Rg", 2.2e3))
+        source_line = f"B1 in 0 V=0.01*sin(2*3.1415926535*{f_wanted}*time)"
+        circuit_lines = f"""XOP in n_inv out 0 OPAMP_1POLE
+Rf out n_inv {rf_s}
+Rg n_inv 0 {rg_s}
+"""
+    else:
+        raise ValueError(f"Unknown circuit_id: {circuit_id}")
+
+    with tempfile.NamedTemporaryFile(suffix=".cir", delete=False, mode="w") as f_cir:
+        cir_path = f_cir.name
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f_out:
+        out_path = f_out.name
+
+    out_spice_path = out_path.replace("\\", "/")
+    netlist = f"""* Transient simulation
+{OPAMP_SUBCKT}
+{source_line}
+{circuit_lines}
+.control
+tran {t_step:.3e} {t_stop:.3e}
+wrdata {out_spice_path} v(in) v(out)
+quit
+.endc
+.end
+"""
+    try:
+        with open(cir_path, "w") as f:
+            f.write(netlist)
+
+        res = subprocess.run(
+            [ngspice_bin, "-b", cir_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        if res.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError(f"ngspice transient simulation failed:\n{res.stderr}\n{res.stdout}")
+
+        data = np.loadtxt(out_path)
+        if data.ndim != 2 or data.shape[1] < 4:
+            raise ValueError("Corrupt simulation data returned by ngspice transient analysis.")
+
+        time_arr = data[:, 0]
+        v_in = data[:, 1]
+        v_out = data[:, 3]
+        return time_arr, v_in, v_out
+
+    finally:
+        for p in [cir_path, out_path]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+

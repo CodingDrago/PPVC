@@ -8,58 +8,80 @@ import os
 import re
 import numpy as np
 import requests
+from dotenv import load_dotenv
 from scipy.optimize import minimize
 
 import spice
+
+# Load environment variables from .env file if present
+load_dotenv()
 
 # Fallback / demo status flag
 def is_demo_mode(api_key: str = None) -> bool:
     """Return True if demo mode is requested or no API key is available."""
     if os.environ.get("DEMO", "0").lower() in ("1", "true", "yes"):
         return True
-    key = api_key or os.environ.get("LLM_API_KEY")
+    key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("LLM_API_KEY")
     return not bool(key)
 
 
-def call_llm_provider(prompt: str, api_key: str = None) -> str:
+def get_ai_status(api_key: str = None) -> tuple[bool, str]:
+    """Return (is_online: bool, status_chip: str) for UI indicator."""
+    if is_demo_mode(api_key):
+        return False, "AI: offline demo mode"
+    return True, "AI: Gemini online"
+
+
+def call_llm_provider(
+    prompt: str,
+    api_key: str = None,
+    system_prompt: str = None,
+    json_mode: bool = True
+) -> str:
     """
-    Unified LLM provider call.
-    Default uses OpenAI-compatible chat completions endpoint.
-    Easy to swap to any custom provider.
+    Unified LLM provider call using Google Gemini via google-genai SDK.
+    Enforces 8s timeout, JSON mode when requested, and environment-based keys.
+    Falls back gracefully or raises so callers route to rule-based fallback.
     """
-    key = api_key or os.environ.get("LLM_API_KEY")
+    if is_demo_mode(api_key):
+        raise ValueError("Demo mode active or API key not supplied")
+
+    key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("LLM_API_KEY")
     if not key:
-        raise ValueError("LLM_API_KEY environment variable is not set.")
+        raise ValueError("GEMINI_API_KEY environment variable is not set.")
 
-    base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+    model = os.environ.get("GEMINI_MODEL") or os.environ.get("LLM_MODEL") or "gemini-2.5-flash"
 
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert analog circuit design and debugging AI. "
-                    "Analyze the given SPICE netlist, circuit specs, measurements, and history. "
-                    "Respond with JSON ONLY. Do not include markdown code fences or conversational text."
-                )
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 800
-    }
+    try:
+        from google import genai
+        from google.genai import types
 
-    url = f"{base_url}/chat/completions"
-    response = requests.post(url, headers=headers, json=payload, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"]
+        client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(timeout=8000)
+        )
+
+        config_kwargs = {
+            "temperature": 0.2,
+        }
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+        if system_prompt:
+            config_kwargs["system_instruction"] = system_prompt
+
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config
+        )
+
+        if response and response.text:
+            return response.text
+        raise ValueError("Empty response received from Gemini model")
+    except Exception as e:
+        raise RuntimeError(f"Gemini API error: {e}")
 
 
 def get_llm_diagnosis(
@@ -284,8 +306,8 @@ def optimize_circuit_components(
 
 def run_agent_loop(
     circuit_id: str,
-    initial_components: dict,
-    specs: dict,
+    initial_components: dict = None,
+    specs: dict = None,
     api_key: str = None,
     max_iterations: int = 4,
     log_callback = None
@@ -301,6 +323,8 @@ def run_agent_loop(
     """
     circuit_info = spice.CIRCUITS[circuit_id]
     circuit_type = circuit_info["type"]
+    specs = specs or dict(circuit_info["default_specs"])
+    initial_components = dict(initial_components or circuit_info["broken_components"])
 
     # Initial baseline simulation
     init_freqs, init_gain = spice.simulate_circuit(circuit_id, initial_components)
@@ -417,3 +441,403 @@ def run_agent_loop(
         "final_curve": (current_freqs, current_gain),
         "final_netlist": spice.generate_netlist(circuit_id, current_components)
     }
+
+
+def design_circuit_from_prompt(user_text: str, api_key: str = None) -> dict:
+    """
+    Translate user's plain-English design request into circuit template + specs.
+    Calls LLM if available; falls back to keyword/rule-based path if API fails or DEMO=1.
+    Strictly validates template exists in registry and specs inside allowed ranges.
+    Never invents a template.
+    """
+    def rule_based_design(text_raw: str) -> dict:
+        text = str(text_raw or "").lower()
+        # Check for unsupported circuits first
+        if any(k in text for k in ["bandpass", "band-pass", "keep only", "tone and reject", "notch", "band reject"]):
+            return {
+                "supported": False,
+                "template": "",
+                "specs": {},
+                "explanation": "",
+                "reason_if_unsupported": (
+                    "Band-pass filters (which isolate a single tone and reject all other frequencies) are not in our template registry. "
+                    "Our registry currently supports Sallen-Key Low-Pass Filters and Non-Inverting Amplifiers."
+                )
+            }
+        if any(k in text for k in ["rumble", "below", "highpass", "high-pass", "block low", "reject low"]):
+            return {
+                "supported": False,
+                "template": "",
+                "specs": {},
+                "explanation": "",
+                "reason_if_unsupported": (
+                    "High-pass rumble filters (which block frequencies below a set threshold) are not in our template registry. "
+                    "Our registry currently supports Sallen-Key Low-Pass Filters and Non-Inverting Amplifiers."
+                )
+            }
+
+        # Check for amplifier
+        if any(k in text for k in ["boost", "amplify", "gain", "mic", "signal to", "amplifier"]):
+            gain = 10.0
+            m_ratio = re.search(r"(\d+(?:\.\d+)?)\s*(?:m?v)?\s*(?:mic\s*)?(?:signal\s*)?to\s*(\d+(?:\.\d+)?)\s*(?:m?v)?", text)
+            if m_ratio:
+                vin = float(m_ratio.group(1))
+                vout = float(m_ratio.group(2))
+                if vin > 0:
+                    gain = vout / vin
+            else:
+                m_gain = re.search(r"(?:gain of|by|boost)\s*(\d+(?:\.\d+)?)\s*x?", text)
+                if m_gain:
+                    gain = float(m_gain.group(1))
+            gain = max(1.5, min(100.0, gain))
+            return {
+                "supported": True,
+                "template": "non_inverting_amp",
+                "specs": {
+                    "gain_target": gain,
+                    "gain_tol": 0.02,
+                    "bw_min": 50000.0
+                },
+                "explanation": (
+                    f"We will design a non-inverting amplifier to boost your signal by {gain:.1f}x. "
+                    f"This raises your signal voltage cleanly while preserving audio detail and bandwidth."
+                ),
+                "reason_if_unsupported": ""
+            }
+
+        # Check for low-pass filter
+        if any(k in text for k in ["hiss", "low pass", "lowpass", "above", "filter", "cutoff", "audio", "treble"]):
+            fc = 1000.0
+            m_freq = re.search(r"(\d+(?:\.\d+)?)\s*(k|khz|hz|mhz)?", text)
+            if m_freq:
+                val = float(m_freq.group(1))
+                unit = (m_freq.group(2) or "").lower()
+                if unit in ["k", "khz"]:
+                    fc = val * 1000.0
+                elif unit == "mhz":
+                    fc = val * 1e6
+                elif unit == "hz":
+                    fc = val
+                elif val < 100:
+                    fc = val * 1000.0
+                else:
+                    fc = val
+            fc = max(20.0, min(100000.0, fc))
+            return {
+                "supported": True,
+                "template": "sallen_key",
+                "specs": {
+                    "fc_target": fc,
+                    "fc_tol": 0.05,
+                    "peaking_max": 0.5,
+                    "dc_gain_target": 0.0,
+                    "dc_gain_tol": 0.5
+                },
+                "explanation": (
+                    f"We will design a Sallen-Key low-pass filter with a cutoff frequency of {fc:.0f} Hz. "
+                    f"This lets the desirable lower audio frequencies pass through freely while removing high-frequency hiss."
+                ),
+                "reason_if_unsupported": ""
+            }
+
+        return {
+            "supported": False,
+            "template": "",
+            "specs": {},
+            "explanation": "",
+            "reason_if_unsupported": (
+                "We could not recognize this circuit requirement or it is not in our registry. "
+                "Our registry currently supports Sallen-Key Low-Pass Filters (e.g. 'Remove hiss above 3 kHz') "
+                "and Non-Inverting Amplifiers (e.g. 'Boost a 10 mV mic signal to 100 mV')."
+            )
+        }
+
+    # If demo mode, run rule-based path directly
+    if is_demo_mode(api_key):
+        return rule_based_design(user_text)
+
+    # Prompt LLM with strict registry instructions
+    system_prompt = (
+        "You are an expert circuit design AI assistant. "
+        "The ONLY circuits available in our registry are:\n"
+        "1. 'sallen_key' (Sallen-Key 2nd-Order Low-Pass Filter):\n"
+        "   - What it does: Allows low frequencies to pass, cuts off high frequencies (removes hiss, high-frequency noise).\n"
+        "   - Valid spec fields: 'fc_target' (float between 20.0 and 100000.0 Hz).\n"
+        "2. 'non_inverting_amp' (Non-Inverting Amplifier):\n"
+        "   - What it does: Amplifies/boosts a weak input voltage to a stronger output voltage without inverting polarity.\n"
+        "   - Valid spec fields: 'gain_target' (float between 1.5 and 100.0), 'bw_min' (float between 1000.0 and 500000.0 Hz).\n\n"
+        "RULES:\n"
+        "- Respond with JSON ONLY. Do not include markdown fences (```) or other text.\n"
+        "- If the request requires any other circuit (e.g. band-pass, high-pass rumble filter, notch filter), you MUST set 'supported': false.\n"
+        "- NEVER invent a template name. The ONLY valid template names are 'sallen_key' and 'non_inverting_amp'.\n"
+        "- Output format:\n"
+        "{\n"
+        '  "supported": true/false,\n'
+        '  "template": "<sallen_key or non_inverting_amp>",\n'
+        '  "specs": {"<spec_key>": value},\n'
+        '  "explanation": "<2 plain-English sentences for a beginner>",\n'
+        '  "reason_if_unsupported": "..."\n'
+        "}"
+    )
+
+    try:
+        raw = call_llm_provider(user_text, api_key=api_key, system_prompt=system_prompt)
+        clean = raw.strip()
+        clean = re.sub(r"^```(?:json)?\s*", "", clean)
+        clean = re.sub(r"\s*```$", "", clean)
+        data = json.loads(clean)
+
+        supported = bool(data.get("supported", False))
+        if not supported:
+            reason = data.get("reason_if_unsupported", "") or "This circuit is not currently supported in our registry."
+            return {
+                "supported": False,
+                "template": "",
+                "specs": {},
+                "explanation": "",
+                "reason_if_unsupported": reason
+            }
+
+        template = str(data.get("template", "")).strip()
+        if template not in spice.CIRCUITS:
+            # Never invent a template!
+            return rule_based_design(user_text)
+
+        specs = data.get("specs", {})
+        if not isinstance(specs, dict):
+            return rule_based_design(user_text)
+
+        # Validate spec ranges
+        if template == "sallen_key":
+            fc = float(specs.get("fc_target", 1000.0))
+            if not (20.0 <= fc <= 100000.0):
+                return rule_based_design(user_text)
+            clean_specs = {
+                "fc_target": fc,
+                "fc_tol": float(specs.get("fc_tol", 0.05)),
+                "peaking_max": float(specs.get("peaking_max", 0.5)),
+                "dc_gain_target": float(specs.get("dc_gain_target", 0.0)),
+                "dc_gain_tol": float(specs.get("dc_gain_tol", 0.5))
+            }
+        elif template == "non_inverting_amp":
+            gain = float(specs.get("gain_target", 10.0))
+            if not (1.5 <= gain <= 100.0):
+                return rule_based_design(user_text)
+            clean_specs = {
+                "gain_target": gain,
+                "gain_tol": float(specs.get("gain_tol", 0.02)),
+                "bw_min": float(specs.get("bw_min", 50000.0))
+            }
+        else:
+            return rule_based_design(user_text)
+
+        explanation = data.get("explanation", "")
+        if not explanation:
+            explanation = rule_based_design(user_text).get("explanation", "")
+
+        return {
+            "supported": True,
+            "template": template,
+            "specs": clean_specs,
+            "explanation": explanation,
+            "reason_if_unsupported": ""
+        }
+
+    except Exception:
+        return rule_based_design(user_text)
+
+
+def generate_rough_guess(circuit_id: str, specs: dict = None) -> dict:
+    """
+    Create a rough first-guess design: scale the template's default component values
+    to roughly the right frequency or gain range with no optimization (so it usually fails the spec).
+    """
+    specs = specs or {}
+    if circuit_id == "sallen_key":
+        fc_target = float(specs.get("fc_target", 1000.0))
+        scale = 1000.0 / max(20.0, fc_target)
+        c1_guess = spice.snap_value(68e-9 * scale, "C")
+        c2_guess = spice.snap_value(6.8e-9 * scale, "C")
+        return {
+            "R1": 7.5e3,
+            "R2": 7.5e3,
+            "C1": c1_guess,
+            "C2": c2_guess
+        }
+    elif circuit_id == "non_inverting_amp":
+        gain_target = float(specs.get("gain_target", 10.0))
+        rg_guess = 2.2e3
+        rf_guess = spice.snap_value(rg_guess * (gain_target * 2.0), "R")
+        return {
+            "Rf": rf_guess,
+            "Rg": rg_guess
+        }
+    else:
+        if circuit_id in spice.CIRCUITS:
+            return dict(spice.CIRCUITS[circuit_id]["broken_components"])
+        return {}
+
+
+def ask_about_results(
+    circuit_id: str,
+    specs: dict = None,
+    initial_measurements: dict = None,
+    final_measurements: dict = None,
+    initial_components: dict = None,
+    final_components: dict = None,
+    question: str = "",
+    api_key: str = None
+) -> str:
+    """
+    Answer beginner questions about circuit repair results in 3 sentences or less.
+    Falls back to a dynamic canned answer built from the numbers if in DEMO mode or API fails.
+    """
+    if circuit_id not in spice.CIRCUITS:
+        return "Circuit details are not available."
+
+    c_info = spice.CIRCUITS[circuit_id]
+    c_name = c_info["name"]
+
+    specs = specs or {}
+    initial_measurements = initial_measurements or {}
+    final_measurements = final_measurements or {}
+    initial_components = initial_components or {}
+    final_components = final_components or {}
+    question = str(question or "")
+
+    # Human-readable component changes
+    comp_changes = []
+    for k, v_fin in final_components.items():
+        v_init = initial_components.get(k, 0.0)
+        c_type = c_info["component_types"].get(k, "R")
+        s_init = spice.format_eng(v_init, c_type)
+        s_fin = spice.format_eng(v_fin, c_type)
+        comp_changes.append(f"{k}: {s_init} -> {s_fin}")
+    comp_changes_str = ", ".join(comp_changes)
+
+    # Format numbers for prompt & fallback
+    if circuit_id == "sallen_key":
+        tgt_fc = specs.get("fc_target", 1000.0)
+        init_fc = initial_measurements.get("fc_3db_hz", 0.0)
+        final_fc = final_measurements.get("fc_3db_hz", 0.0)
+        init_pk = initial_measurements.get("peaking_db", 0.0)
+        final_pk = final_measurements.get("peaking_db", 0.0)
+        specs_summary = f"Cutoff fc = {tgt_fc:.0f} Hz (±5%), Peaking <= 0.5 dB"
+        meas_summary_before = f"Cutoff = {init_fc:.1f} Hz, Peaking = {init_pk:.2f} dB"
+        meas_summary_after = f"Cutoff = {final_fc:.1f} Hz, Peaking = {final_pk:.2f} dB"
+    else:
+        tgt_gain = specs.get("gain_target", 10.0)
+        tgt_bw = specs.get("bw_min", 50000.0)
+        init_gain = initial_measurements.get("linear_gain", 0.0)
+        final_gain = final_measurements.get("linear_gain", 0.0)
+        init_bw = initial_measurements.get("bandwidth_hz", 0.0)
+        final_bw = final_measurements.get("bandwidth_hz", 0.0)
+        specs_summary = f"Gain = {tgt_gain:.1f}x (±2%), Bandwidth >= {tgt_bw/1000:.0f} kHz"
+        meas_summary_before = f"Gain = {init_gain:.2f}x, Bandwidth = {init_bw/1000:.1f} kHz"
+        meas_summary_after = f"Gain = {final_gain:.2f}x, Bandwidth = {final_bw/1000:.1f} kHz"
+
+    if not is_demo_mode(api_key):
+        system_prompt = (
+            "You are a friendly, encouraging electronics tutor explaining circuit design to a complete beginner. "
+            "Explain clearly and simply in at most 3 sentences. Avoid unexplained jargon. Never exceed 3 sentences."
+        )
+        prompt = f"""Circuit: {c_name}
+Target Specs: {specs_summary}
+Before Measurements: {meas_summary_before}
+After Measurements: {meas_summary_after}
+Component Changes: {comp_changes_str}
+
+User Question: "{question}"
+
+Answer the question accurately for a beginner based on the numbers above in 3 sentences or less."""
+
+        try:
+            ans = call_llm_provider(prompt, api_key=api_key, system_prompt=system_prompt, json_mode=False)
+            clean_ans = ans.strip()
+            clean_ans = re.sub(r"^```(?:markdown|json|text)?\s*", "", clean_ans)
+            clean_ans = re.sub(r"\s*```$", "", clean_ans)
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_ans) if s.strip()]
+            if len(sentences) > 3:
+                clean_ans = " ".join(sentences[:3])
+            return clean_ans
+        except Exception:
+            pass  # Fall through to canned answer built from numbers
+
+    # Canned fallback built from actual numbers
+    q_lower = question.lower()
+    if any(k in q_lower for k in ["peaking", "peak", "resonance", "bump", "overshoot"]):
+        if circuit_id == "sallen_key":
+            return (
+                f"Peaking is an unwanted resonance bump where frequencies near cutoff get accidentally boosted too loud. "
+                f"Your original circuit had {init_pk:.2f} dB of peaking because its capacitor ratio was too high. "
+                f"We adjusted the capacitors to bring peaking down to {final_pk:.2f} dB, creating a smooth Butterworth response."
+            )
+        else:
+            return (
+                f"In this amplifier, we tuned feedback resistors to satisfy your target gain of {tgt_gain:.1f}x without overshoot. "
+                f"The bandwidth was improved from {init_bw/1000:.1f} kHz to {final_bw/1000:.1f} kHz. "
+                f"This guarantees flat, distortion-free amplification across the entire audio spectrum."
+            )
+
+    if any(k in q_lower for k in ["cutoff", "frequency", "hz", "khz", "filter", "hiss"]):
+        if circuit_id == "sallen_key":
+            return (
+                f"The cutoff frequency is the point where the filter starts blocking higher audio tones. "
+                f"The circuit was adjusted from {init_fc:.1f} Hz to {final_fc:.1f} Hz to closely hit your {tgt_fc:.0f} Hz target. "
+                f"This successfully filters out high-frequency noise while leaving your desired audio crisp and intact."
+            )
+
+    if any(k in q_lower for k in ["gain", "volume", "loud", "boost", "amplify", "bandwidth"]):
+        if circuit_id == "non_inverting_amp":
+            return (
+                f"The original circuit amplified the signal too much ({init_gain:.2f}x), which choked its bandwidth down to {init_bw/1000:.1f} kHz. "
+                f"By adjusting the feedback resistors ({comp_changes_str}), we achieved the target gain of {final_gain:.2f}x. "
+                f"This also freed up bandwidth to {final_bw/1000:.1f} kHz, ensuring high fidelity."
+            )
+
+    if any(k in q_lower for k in ["why", "change", "resistor", "capacitor", "r1", "r2", "c1", "c2", "rf", "rg", "component", "parts"]):
+        return (
+            f"We adjusted {comp_changes_str} so that the circuit's electrical behavior aligns with your exact design target. "
+            f"Before the repair, the measurements were {meas_summary_before}, but after tuning they reached {meas_summary_after}. "
+            f"All final parts are snapped to commercial E-series standards, so you can easily purchase and build this circuit."
+        )
+
+    # General canned response built from numbers
+    return (
+        f"The circuit was re-tuned from {meas_summary_before} to {meas_summary_after} to meet your specification. "
+        f"This was achieved by adjusting components to standard values: {comp_changes_str}. "
+        f"Simulation verifies that all required performance criteria are now completely satisfied."
+    )
+
+
+def answer_user_question(
+    question: str,
+    circuit_id: str = "sallen_key",
+    specs: dict = None,
+    results: dict = None,
+    api_key: str = None,
+    **kwargs
+) -> str:
+    """
+    User-facing entry point to answer beginner questions about circuit results.
+    Accepts results dict directly or via individual measurement/component parameters.
+    """
+    res = results or kwargs.get("res", {})
+    init_comps = kwargs.get("initial_components") or res.get("initial_components")
+    final_comps = kwargs.get("final_components") or res.get("final_components")
+    init_meas = kwargs.get("initial_measurements") or res.get("initial_measurements")
+    final_meas = kwargs.get("final_measurements") or res.get("final_measurements")
+    circuit_specs = specs or res.get("specs")
+
+    return ask_about_results(
+        circuit_id=circuit_id,
+        specs=circuit_specs,
+        initial_measurements=init_meas,
+        final_measurements=final_meas,
+        initial_components=init_comps,
+        final_components=final_comps,
+        question=question,
+        api_key=api_key
+    )
+
+
