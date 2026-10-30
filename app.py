@@ -23,6 +23,12 @@ import streamlit as st
 import agent
 import components
 import spice
+if not hasattr(spice, "format_value"):
+    def _format_value(val: float, comp_type_or_name: str = "") -> str:
+        t = "C" if (str(comp_type_or_name).startswith("C") or comp_type_or_name == "C") else ""
+        return spice.format_eng(val, t)
+    spice.format_value = _format_value
+
 import theme
 
 # 1. Page Configuration
@@ -899,21 +905,79 @@ with st.container(border=True):
 with st.container(border=True):
     st.markdown('<div class="silkscreen-label">DUT • LIVE SCHEMATIC BLUEPRINT</div>', unsafe_allow_html=True)
 
-    final_c = st.session_state.results["final_components"] if st.session_state.results else st.session_state.components
-    initial_c = st.session_state.results["initial_components"] if st.session_state.results else st.session_state.components
+    has_results = bool(st.session_state.results)
+    initial_c = st.session_state.results["initial_components"] if has_results else st.session_state.components
+    final_c = st.session_state.results["final_components"] if has_results else None
 
-    try:
-        components.render_live_schematic(
-            circuit_id=selected_cid,
-            initial_components=initial_c,
-            final_components=final_c,
-            is_fixed=bool(st.session_state.results),
-            height=330
-        )
-    except Exception:
-        st.caption("Standard schematic view")
-        fig_sch = draw_circuit_schematic(selected_cid, final_c)
-        st.pyplot(fig_sch)
+    # Determine changed_names by comparing initial vs final (differ by more than 0.5%)
+    changed_names = set()
+    if has_results and final_c:
+        for k, init_val in initial_c.items():
+            if k in final_c:
+                fin_val = final_c[k]
+                denom = max(abs(init_val), 1e-12)
+                if abs(fin_val - init_val) / denom > 0.005:
+                    changed_names.add(k)
+
+    col_before, col_after = st.columns(2)
+
+    with col_before:
+        st.markdown('<div class="silkscreen-label">DUT • BEFORE</div>', unsafe_allow_html=True)
+        try:
+            components.render_live_schematic(
+                components=initial_c,
+                label="BEFORE (broken)",
+                changed_names=changed_names,
+                circuit_id=selected_cid,
+                old_components=initial_c
+            )
+        except Exception:
+            st.caption("Standard schematic view")
+            fig_sch = draw_circuit_schematic(selected_cid, initial_c)
+            st.pyplot(fig_sch)
+
+    with col_after:
+        st.markdown('<div class="silkscreen-label">DUT • AFTER</div>', unsafe_allow_html=True)
+        if has_results and final_c:
+            try:
+                components.render_live_schematic(
+                    components=final_c,
+                    label="AFTER (verified)",
+                    changed_names=changed_names,
+                    circuit_id=selected_cid,
+                    old_components=initial_c
+                )
+            except Exception:
+                st.caption("Standard schematic view")
+                fig_sch = draw_circuit_schematic(selected_cid, final_c)
+                st.pyplot(fig_sch)
+        else:
+            placeholder_html = textwrap.dedent("""
+            <div style="background: #070B0E; border: 1px dashed #1B2A33; border-radius: 8px; min-height: 260px; height: 100%; display: flex; align-items: center; justify-content: center; text-align: center; color: #6F8793; font-family: 'Space Grotesk', sans-serif; font-size: 14px; padding: 20px;">
+            Run a fix to see the verified circuit here
+            </div>
+            """).strip()
+            st.markdown(placeholder_html, unsafe_allow_html=True)
+
+    # Under both columns: show component changes line
+    if has_results and changed_names and final_c:
+        comp_order = {"R1": 1, "R2": 2, "C1": 3, "C2": 4, "Rf": 1, "Rg": 2}
+        sorted_keys = sorted(changed_names, key=lambda x: comp_order.get(x, 99))
+        changes_list = []
+        for k in sorted_keys:
+            init_v_str = spice.format_value(initial_c[k], k)
+            fin_v_str = spice.format_value(final_c[k], k)
+            changes_list.append(f"{k} {init_v_str} -> {fin_v_str}")
+        change_line = f"Changed: {', '.join(changes_list)}"
+    else:
+        change_line = "No component changes needed."
+
+    st.markdown(
+        f'<div style="font-family: \'JetBrains Mono\', monospace; font-size: 13px; color: #9FB3BE; padding-top: 10px; margin-top: 8px; border-top: 1px solid #1B2A33;">'
+        f'{change_line}'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
 
 # ==============================================================================

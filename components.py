@@ -5,6 +5,7 @@ Signal Cleanup CRT, and System Boot Sequence.
 Pure HTML5/Canvas/SVG/JS with zero external dependencies.
 """
 
+import io
 import json
 import textwrap
 import matplotlib
@@ -16,6 +17,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import spice
+if not hasattr(spice, "format_value"):
+    def _format_value(val: float, comp_type_or_name: str = "") -> str:
+        t = "C" if (str(comp_type_or_name).startswith("C") or comp_type_or_name == "C") else ""
+        return spice.format_eng(val, t)
+    spice.format_value = _format_value
+
 
 
 def render_oscilloscope_bode(
@@ -458,58 +465,76 @@ def render_oscilloscope_bode(
     components.html(html_code, height=height, scrolling=False)
 
 
-def render_live_schematic(
-    circuit_id: str = "sallen_key",
-    initial_components: dict = None,
-    final_components: dict = None,
-    components: dict = None,
-    is_fixed: bool = False,
-    caption: str = "",
-    height: int = 340,
-    **kwargs
-):
+@st.cache_data
+def get_schematic_png(
+    circuit_id: str,
+    components_tuple: tuple,
+    label: str = "",
+    changed_names_tuple: tuple = (),
+    old_components_tuple: tuple = ()
+) -> bytes:
     """
-    Component B: Live Schematic rendered via schemdraw.
-    - Sallen-Key: filter node after R2 (where C2 goes to ground) connects to op-amp's
-      NON-inverting (+) input (in2).
-    - Vout feeds back to the INVERTING (-) input (in1).
-    - Op-amp draws + and - signs.
-    - Wires land exactly on output node using .tox() / .toy().
-    - C2 label is placed clearly away from any wire.
+    Generate and cache PNG bytes for the circuit schematic.
+    Uses identical fixed figsize, xlim, and ylim for BEFORE and AFTER states.
+    No axis frame or tick numbers.
     """
-    comps = final_components or components or initial_components or {}
-    plt.close("all")
+    comps = dict(components_tuple) if components_tuple else {}
+    old_comps = dict(old_components_tuple) if old_components_tuple else {}
+    changed_names = set(changed_names_tuple) if changed_names_tuple else set()
+    is_after = "AFTER" in (label or "").upper()
 
-    fig = plt.figure(figsize=(7.5, 4.2), facecolor="#0E1419")
+    scope_amber = "#FFB000"
+    dim_amber = "#B8742B"
+    default_color = "#D7E3EA"
+
+    def get_comp_style(name: str, default_val: float):
+        val = comps.get(name, default_val)
+        val_str = spice.format_value(val, name)
+        is_changed = name in changed_names
+
+        if is_after:
+            if is_changed:
+                old_val = old_comps.get(name, val)
+                old_str = spice.format_value(old_val, name)
+                lbl = f"{name}\n{val_str}\nwas {old_str}"
+                return scope_amber, lbl
+            else:
+                return default_color, f"{name}\n{val_str}"
+        else:
+            if is_changed:
+                return dim_amber, f"{name}\n{val_str}"
+            else:
+                return default_color, f"{name}\n{val_str}"
+
+    fig = plt.figure(figsize=(6.0, 3.8), facecolor="#0E1419")
     ax = fig.gca()
     ax.set_facecolor("#0E1419")
 
     d = schemdraw.Drawing(canvas=ax)
-    d.config(fontsize=10, unit=2.2, color="#D7E3EA", lw=1.8, font="monospace")
+    d.config(fontsize=9, unit=2.2, color="#D7E3EA", lw=1.8, font="monospace")
 
     if circuit_id == "sallen_key":
-        r1_val = spice.format_eng(comps.get("R1", 7.5e3), "R")
-        r2_val = spice.format_eng(comps.get("R2", 7.5e3), "R")
-        c1_val = spice.format_eng(comps.get("C1", 68e-9), "C")
-        c2_val = spice.format_eng(comps.get("C2", 6.8e-9), "C")
+        c_r1, lbl_r1 = get_comp_style("R1", 7.5e3)
+        c_r2, lbl_r2 = get_comp_style("R2", 7.5e3)
+        c_c1, lbl_c1 = get_comp_style("C1", 68e-9)
+        c_c2, lbl_c2 = get_comp_style("C2", 6.8e-9)
 
         # Input
         d += elm.Dot().label("Vin", loc="left", color="#35D0FF")
-        d += elm.Resistor().right().label(f"R1\n{r1_val}", loc="top")
+        d += elm.Resistor().right().label(lbl_r1, loc="top", color=c_r1).color(c_r1)
         d += (n1 := elm.Dot())
 
         # R2
-        d += elm.Resistor().right().label(f"R2\n{r2_val}", loc="top")
+        d += elm.Resistor().right().label(lbl_r2, loc="top", color=c_r2).color(c_r2)
         d += (n_plus := elm.Dot())
 
-        # C2 branch down to ground: default label placement on down() is to the left, clear of wires
+        # C2 branch down to ground (schemdraw places label left of plates without loc)
         d.push()
-        d += elm.Capacitor().down().label(f"C2\n{c2_val}")
-        d += elm.Ground()
+        d += elm.Capacitor().down().label(lbl_c2, color=c_c2).color(c_c2)
+        d += elm.Ground().color(default_color)
         d.pop()
 
         # Op-amp pointing right, anchored at in2 (+) aligned horizontally with n_plus
-        # in1 is inverting (-), in2 is non-inverting (+)
         op = elm.Opamp(sign=True, leads=True).right().at((n_plus.center[0] + 1.2, n_plus.center[1])).anchor("in2")
         d += op
 
@@ -527,50 +552,108 @@ def render_live_schematic(
         d += elm.Line().toy(op.in1)
 
         # Upper C1 branch: from n1 up, across to out_dot
-        d += elm.Line().at(n1.center).up().length(2.8)
-        d += elm.Capacitor().tox(out_dot.center[0]).label(f"C1\n{c1_val}", loc="top")
+        d += elm.Line().at(n1.center).up().length(3.0)
+        d += elm.Capacitor().tox(out_dot.center[0]).label(lbl_c1, loc="top", color=c_c1).color(c_c1)
         d += elm.Line().toy(out_dot.center[1])
 
+        d.draw(show=False)
+        ax.set_xlim(-1.2, 12.0)
+        ax.set_ylim(-3.5, 4.8)
+        ax.axis("off")
+
     elif circuit_id == "non_inverting_amp":
-        rf_val = spice.format_eng(comps.get("Rf", 100e3), "R")
-        rg_val = spice.format_eng(comps.get("Rg", 2.2e3), "R")
+        c_rf, lbl_rf = get_comp_style("Rf", 100e3)
+        c_rg, lbl_rg = get_comp_style("Rg", 2.2e3)
 
         d += elm.Dot().label("Vin", loc="left", color="#35D0FF")
         d += elm.Line().right().length(1.2)
         op = elm.Opamp(sign=True, leads=True).right().anchor("in2")
         d += op
 
-        # Output node
+        # Output lead and node
         d += elm.Line().at(op.out).right().length(1.2)
         d += (out_dot := elm.Dot())
         d += elm.Line().at(out_dot.center).right().length(0.8).label("Vout", loc="right", color="#39FF88")
 
-        # Feedback loop through Rf
-        d += elm.Line().at(out_dot.center).down().length(1.8)
-        d += elm.Resistor().left().tox(op.in1[0] - 0.8).label(f"Rf\n{rf_val}", loc="bottom")
+        # Feedback loop through Rf to inverting node
+        d += elm.Line().at(out_dot.center).up().length(2.0)
+        d += elm.Resistor().left().tox(op.in1[0] - 0.8).label(lbl_rf, loc="top", color=c_rf).color(c_rf)
         d += (inv_node := elm.Dot())
 
-        # Up to inverting input in1 (-)
+        # Connection down to inverting input in1 (-)
         d += elm.Line().toy(op.in1)
         d += elm.Line().to(op.in1)
 
-        # Down from inv_node through Rg to Ground
-        d += elm.Resistor().at(inv_node.center).down().length(2.0).label(f"Rg\n{rg_val}")
-        d += elm.Ground()
+        # Rg resistor to ground from inv_node
+        d += elm.Resistor().at(inv_node.center).left().length(2.0).label(lbl_rg, loc="top", color=c_rg).color(c_rg)
+        d += elm.Ground().color(default_color)
+
+        d.draw(show=False)
+        ax.set_xlim(-3.8, 7.8)
+        ax.set_ylim(-2.0, 4.4)
+        ax.axis("off")
 
     else:
         d += elm.Dot().label("Vin", loc="left")
         d += elm.Line().right().length(2).label(f"Circuit: {circuit_id}")
         d += elm.Dot().label("Vout", loc="right")
+        d.draw(show=False)
+        ax.set_xlim(-1, 5)
+        ax.set_ylim(-2, 2)
+        ax.axis("off")
 
-    fig = d.draw(show=False).fig
-    fig.patch.set_facecolor("#0E1419")
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor="#0E1419", dpi=150)
     plt.close(fig)
+    return buf.getvalue()
 
-    if caption:
-        st.caption(f"ℹ️ {caption}")
+
+def render_live_schematic(
+    components: dict = None,
+    label: str = "",
+    changed_names: set = None,
+    circuit_id: str = "sallen_key",
+    old_components: dict = None,
+    **kwargs
+):
+    """
+    Component B: Live Schematic rendered via schemdraw and cached via st.cache_data.
+    Accepts components, label string ("BEFORE (broken)" or "AFTER (verified)"),
+    and optional changed_names set.
+    """
+    if isinstance(components, str):
+        circuit_id = components
+        components = kwargs.get("components") or {}
+    if "circuit_id" in kwargs:
+        circuit_id = kwargs["circuit_id"]
+    if components is None:
+        components = kwargs.get("final_components") or kwargs.get("initial_components") or {}
+    if old_components is None:
+        old_components = kwargs.get("initial_components") or {}
+    if changed_names is None:
+        changed_names = kwargs.get("changed_names") or set()
+    if not isinstance(changed_names, (set, list, tuple)):
+        changed_names = set()
+    else:
+        changed_names = set(changed_names)
+
+    comp_tuple = tuple(sorted((str(k), float(v)) for k, v in components.items()))
+    old_comp_tuple = tuple(sorted((str(k), float(v)) for k, v in old_components.items()))
+    changed_tuple = tuple(sorted(str(k) for k in changed_names))
+
+    png_bytes = get_schematic_png(
+        circuit_id=circuit_id,
+        components_tuple=comp_tuple,
+        label=label,
+        changed_names_tuple=changed_tuple,
+        old_components_tuple=old_comp_tuple
+    )
+
+    try:
+        st.image(png_bytes, width="stretch")
+    except TypeError:
+        st.image(png_bytes, use_container_width=True)
+
 
 
 def render_pipeline_strip(current_step: int = 1, active_caption: str = "", height: int = 140, **kwargs):
